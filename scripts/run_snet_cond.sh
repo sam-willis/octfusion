@@ -5,7 +5,7 @@ DATE_WITH_TIME=`date "+%Y-%m-%dT%H-%M-%S"`
 logs_dir='logs'
 
 ### set gpus ###
-gpu_ids=0,1,2,3       # multi-gpu
+gpu_ids=0          # single-gpu
 
 if [ ${#gpu_ids} -gt 1 ]; then
     # specify these two if multi-gpu
