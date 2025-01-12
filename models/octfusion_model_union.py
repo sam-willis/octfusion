@@ -298,58 +298,87 @@ class OctFusionModel(BaseModel):
         return times
 
     @torch.no_grad()
-    def sample_loop(self, doctree_lr = None, ema=False, shape=None, ddim_steps=200, label=None, unet_type="lr", unet_lr=None, df_type="x0", truncated_index=0.0):
+    def sample_loop(self, doctree_lr = None, ema=False, shape=None, ddim_steps=200, label=None, unet_type="lr", unet_lr=None, df_type="x0", truncated_index=0.0, deterministic=False):
         batch_size = self.vq_conf.data.test.batch_size
 
         time_pairs = self.get_sampling_timesteps(
             batch_size, device=self.device, steps=ddim_steps)
 
-        noised_data = torch.randn(shape, device = self.device)
-
-        x_start = None
+        x_t = torch.randn(shape, device = self.device)
+        x_0_current = None
 
         time_iter = tqdm(time_pairs, desc='small sampling loop time step')
 
         for t, t_next in time_iter:
 
-            log_snr = self.log_snr(t)
-            log_snr_next = self.log_snr(t_next)
-            noise_cond = log_snr
+            # -- Log-SNR at the current step (t) and the next step (t_next)
+            log_snr_t = self.log_snr(t)
+            log_snr_t_next = self.log_snr(t_next)
             
-            if ema:
-                output = self.ema_df(unet_type=unet_type, x=noised_data, doctree=doctree_lr,  timesteps=noise_cond, unet_lr=unet_lr, x_self_cond=x_start, label=label)
-            else:
-                output = self.df(unet_type=unet_type, x=noised_data, doctree=doctree_lr,  timesteps=noise_cond, unet_lr=unet_lr, x_self_cond=x_start, label=label)
+            # This will be the condition input to the network (could be the same as log_snr_t)
+            noise_cond = log_snr_t
 
+            assert ema
+
+            # -- 'x_t' is our current noisy sample; the network outputs 'x_0_pred'
+            output = self.ema_df(
+                unet_type=unet_type,
+                x=x_t,
+                doctree=doctree_lr,
+                timesteps=noise_cond,   # conditioning on log-SNR or any other time encoding
+                unet_lr=unet_lr,
+                x_self_cond=x_0_current,
+                label=label
+            )
+
+            # Optional sign clamp
             if t[0] < truncated_index and unet_type == "lr":
-                output.sign_()
+                x_0_pred.sign_()
 
             if df_type == "x0":
-                x_start = output
-                padded_log_snr, padded_log_snr_next = map(
-                    partial(right_pad_dims_to, noised_data), (log_snr, log_snr_next))
+                x_0_pred = output
+                # Keep track of the predicted x_0 for potential self-conditioning
+                x_0_current = x_0_pred
 
-                alpha, sigma = log_snr_to_alpha_sigma(padded_log_snr)
-                alpha_next, sigma_next = log_snr_to_alpha_sigma(padded_log_snr_next)
-
-                c = -expm1(padded_log_snr - padded_log_snr_next)
-                mean = alpha_next * (noised_data * (1 - c) / alpha + c * output)
-                variance = (sigma_next ** 2) * c
-                noise = torch.where(
-                    # rearrange(t_next > truncated_index, 'b -> b 1 1 1 1'),
-                    right_pad_dims_to(noised_data, t_next > truncated_index),
-                    torch.randn_like(noised_data),
-                    torch.zeros_like(noised_data)
+                # -- Pad log-SNR so it can broadcast over the shape of x_t
+                padded_log_snr_t, padded_log_snr_t_next = map(
+                    partial(right_pad_dims_to, x_t),
+                    (log_snr_t, log_snr_t_next)
                 )
-                noised_data = mean + torch.sqrt(variance) * noise
+                # -- Convert log-SNR to α (alpha) and σ (sigma). 
+                #    alpha_t ~ sqrt(alpha_bar_t), sigma_t ~ sqrt(1 - alpha_bar_t)
+                alpha_t, sigma_t = log_snr_to_alpha_sigma(padded_log_snr_t)
+                alpha_t_next, sigma_t_next = log_snr_to_alpha_sigma(padded_log_snr_t_next)        
+
+                # -- 'c_blend' is the factor that mixes between x_t and x_0
+                c_blend = -expm1(padded_log_snr_t - padded_log_snr_t_next)
+
+                # -- Compute the mean of the next step (x_(t_next)) or x_(t-1) in standard notation
+                x_t = alpha_t_next * (
+                    x_t * (1 - c_blend) / alpha_t + c_blend * x_0_pred
+                )
+                if not deterministic:                
+                    # -- Compute the variance term
+                    x_t_next_variance = (sigma_t_next ** 2) * c_blend
+
+                    # -- Decide whether to add noise. If t_next > truncated_index, we sample noise
+                    noise_term = torch.where(
+                        right_pad_dims_to(x_t, t_next > truncated_index),
+                        torch.randn_like(x_t),
+                        torch.zeros_like(x_t)
+                    )
+
+                    # -- Final update: x_(t_next) = mean + sqrt(variance) * noise
+                    x_t += torch.sqrt(x_t_next_variance) * noise_term
             elif df_type == "eps":
-                alpha, sigma = log_snr_to_alpha_sigma(log_snr)
-                alpha_next, sigma_next = log_snr_to_alpha_sigma(log_snr_next)
-                alpha, sigma, alpha_next, sigma_next = alpha[0], sigma[0], alpha_next[0], sigma_next[0]
-                x_start = (noised_data - output * sigma) / alpha.clamp(min=1e-8)
-                noised_data = x_start * alpha_next + output * sigma_next
-        
-        return noised_data
+                eps = output
+                alpha_t, sigma_t = log_snr_to_alpha_sigma(log_snr_t)
+                alpha_t_next, sigma_t_next = log_snr_to_alpha_sigma(log_snr_t_next)
+                alpha, sigma, alpha_next, sigma_next = alpha_t[0], sigma_t[0], alpha_t_next[0], sigma_t_next[0]
+                x_0_current = (x_t - eps * sigma) / alpha.clamp(min=1e-8)
+                x_t = x_0_current * alpha_next + eps * sigma_next
+
+        return x_t
     
     @torch.no_grad()
     def sample(self, split_small = None, category = 'airplane', prefix = 'results', ema = False, ddim_steps=200, clean = False, save_index = 0):
